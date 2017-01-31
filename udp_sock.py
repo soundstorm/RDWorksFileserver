@@ -1,15 +1,26 @@
-import socket, os
+import socket, os, signal, traceback, time
 
 filedir = "./rdfiles/"
 
 buf_size = 4096
-
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server.bind(('', 50200))
-
 client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-client.bind(('', 40200))
-client.settimeout(1) #non-blocking
+
+HANDSHAKE                = "0261d4890df7".decode("HEX")
+
+TOTAL_ON_TIME            = "01f3d4898d09".decode("HEX")
+TOTAL_PROCESSING_TIME    = "0275d4898d8b".decode("HEX")
+TOTAL_TRAVEL_X           = "0215d4898d2b".decode("HEX")
+TOTAL_TRAVEL_Y           = "0225d4898d3b".decode("HEX")
+TOTAL_PROCESSING_TIMES   = "01f5d4898d0b".decode("HEX")
+TOTAL_LASER_ON_TIME      = "0203d4898d19".decode("HEX")
+PREVIOUS_PROCESSING_TIME = "026bd4898d08".decode("HEX")
+MAINBOARD_VERSION        = "01e1d4890d77".decode("HEX")
+
+POSITION_AXIS_X          = "0213d4898d29".decode("HEX")
+POSITION_AXIS_Y          = "0223d4898d39".decode("HEX")
+POSITION_AXIS_Z          = "0233d4898d49".decode("HEX")
+POSITION_AXIS_A          = "0243d4898d59".decode("HEX")
 
 # thanks to http://stefan.schuermans.info/rdcam/scrambling.html
 MAGIC = 0x88
@@ -39,12 +50,59 @@ def descramblestr(string):
 	return p
 
 # transmitted as 7-bit, 0x80 is reserved (but would be semi-valid here too)
-def generateNumber(number, bytes=5):
+def generateNumber(n, bytes=5):
 	s = ""
 	for i in range(-bytes+1, 1):
-		s += chr((number >> (-7 * i)) & 0x7F)
+		s += chr((n >> (-7 * i)) & 0x7F)
 	return s
 
+def parseNumber(s, chars=5):
+	n = 0
+	for i in range(-chars, 0):
+		n |= ord(s[i]) << (-7 * (i+1))
+	return n
+
+
+def ssend(addr, data):
+	if data[:3] == "\xe2\x09\x89":
+		uns = str(descramble(ord(data[3])))+" - "+descramblestr(data[4:-1])
+	else:
+		uns = descramblestr(data).encode("HEX")
+	print "\x1B[32m> "+addr+": "+(data.encode("hex"))+"\x1B[0m  -  "+uns
+	server.sendto(data, (addr, 40200))
+
+def srecv():
+	data, addr = server.recvfrom(buf_size)
+	print "\x1B[33m< "+addr[0]+": "+data.encode("HEX")+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
+	ssend(addr[0], '\xC6') #send ACK
+	return (data, addr)
+
+def crecv():
+	try:
+		data, addr = client.recvfrom(buf_size)
+	except Exception:
+		print "\x1B[30;48;5;1m TIMEOUT REACHED \x1B[0m"	
+		return (None, None)
+	print "\x1B[43m< "+addr[0]+": "+data.encode("HEX")+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
+	return (data, addr)
+
+def csend(addr, data):
+	print "\x1B[42m> "+addr+": "+(data.encode("hex"))+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
+	client.sendto(data, (addr, 50200))
+	data, server_addr = crecv()
+	if (data != '\xc6'):
+		return False
+	return True
+
+def request(addr, data):
+	if not csend(addr, data):
+		return None
+	resp, addr = crecv()
+	if resp[2:4] == data[4:6]:
+		return resp
+	else:
+		print "\x1B[30;48;5;1m MESSAGE CODE MISMATCH %04x / %04x \x1B[0m" % (resp[2:4], data[4:6])
+		return None
 
 responses = {
 #	                               DA  01  05  7E:                 XX
@@ -105,36 +163,23 @@ responses = {
 #############################################################################################
 }
 
-def ssend(addr, data):
-	if data[:3] == "e20989".decode("HEX"):
-		uns = str(descramble(ord(data[3])))+" - "+descramblestr(data[4:-1])
-	else:
-		uns = descramblestr(data)
-	print "\x1B[32m> "+addr+": "+(data.encode("hex"))+"\x1B[0m  -  "+uns
-	server.sendto(data, (addr, 40200))
+def handshake(addr):
+	return request(addr, "\x02\x61\xd4\x89\x0d\xf7") == "\xd4\x09\x0d\xf7\x8f\xa1\x49\xc3\x99"
 
-def srecv():
-	data, addr = server.recvfrom(buf_size)
-	print "\x1B[33m< "+addr[0]+": "+data.encode("HEX")+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
-	ssend(addr[0], '\xC6') #send ACK
-	return (data, addr)
+def getStates(addr):
+	request(addr, "\x02\x73\xd4\x89\x8d\x89")
+	request(addr, "\x02\x95\xd4\x89\x89\xaf")
+	request(addr, "\x02\xa5\xd4\x89\x89\xbf")
+	request(addr, "\x02\x0f\xd4\x89\x89\x29")
+	request(addr, "\x02\x1f\xd4\x89\x89\x39")
 
-def crecv():
-	try:
-		data, addr = client.recvfrom(buf_size)
-	except Exception:
-		print "\x1B[30;48;5;1m TIMEOUT REACHED \x1B[0m"	
-		return (None, None)
-	print "\x1B[43m< "+addr[0]+": "+data.encode("HEX")+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
-	return (data, addr)
-
-def csend(addr, data):
-	print "\x1B[42m> "+addr+": "+(data.encode("hex"))+"\x1B[0m  -  "+descramblestr(data).encode("HEX")
-	client.sendto(data, (addr, 40200))
-	data, server_addr = client.recv()
-	if (data != '\xc6'):
-		return False
-	return True
+def init(addr):
+	handshake(addr)
+	handshake(addr)
+	request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	
+	
 
 def sendFilelist(addr):
 	print "\x1B[31m# SEND FILELIST\x1B[0m"
@@ -159,7 +204,29 @@ def sendFilelist(addr):
 	print("\x1B[31m# FILELIST SENT\x1B[0m")
 
 def requestFilelist(addr):
-	pass
+	return []
+
+# name=None implies direct start of transmitted file
+def sendFile(addr, file, name=None):
+	init(addr)
+	handshake(addr)
+	request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	getStates(addr)
+	handshake(addr)
+	request(addr, "\x01\xfb\xd4\x89\x03\x9b")
+	handshake(addr)
+	handshake(addr)
+	request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	if name is not None:
+		filelist = requestFilelist(addr)
+		handshake(addr)
+		handshake(addr)
+		request(addr, "\x02\x73\xd4\x89\x89\x8d")
+		request(addr, "\x02\x73\xd4\x89\x89\x8d")
+	#TODO: split file and transmit here
+	if name is not None:
+		csend(addr, "\x01\x59\x70\x89\x60")
 
 def sendSystemInfo(addr, opt):
 	# 0x01 = TOTAL ON TIME            (s)
@@ -169,21 +236,60 @@ def sendSystemInfo(addr, opt):
 	# 0x11 = TOTAL TRAVEL Y           (m)
 	# 0x23 = TOTAL TRAVEL X           (m)
 	ssend(addr, scramblestr("\xda\x01\x04"+chr(opt)+generateNumber(0)))
-'''
-	"01f3d4898d09": scramblestr("\xda\x01\x04\x01"+generateNumber(123)).encode("HEX"),	#TOTAL ON TIME            (s)
-	"0275d4898d8b": scramblestr("\xda\x01\x04\x02"+generateNumber(123)).encode("HEX"),	#TOTAL PROCESSING TIME    (s)
-	"0215d4898d2b": scramblestr("\xda\x01\x04\x23"+generateNumber(123)).encode("HEX"),	#TOTAL TRAVEL X           (m)
-	"0225d4898d3b": scramblestr("\xda\x01\x04\x33"+generateNumber(123)).encode("HEX"),	#TOTAL TRAVEL Y           (m)
-	"01f5d4898d0b": scramblestr("\xda\x01\x04\x03"+generateNumber(123)).encode("HEX"),	#Total processing times   (#)
-	"0203d4898d19": scramblestr("\xda\x01\x04\x11"+generateNumber(123)).encode("HEX"),	#TOTAL LASER ON TIME      (s)
-	"026bd4898d81": scramblestr("\xda\x01\x04\x08"+generateNumber(123)).encode("HEX"),	#PREVIOUS PROCESSING TIME (ms)
-	"01e1d4890d77": scramblestr("\xda\x01\x05\x7f"+"VERSION").encode("HEX"), #MAINBOARD VERSION
-'''
+
+def readSystemInfo(addr, opt):
+	if (opt == 0x01):
+		data = request(addr, TOTAL_ON_TIME)
+	elif (opt == 0x02):
+		data = request(addr, TOTAL_PROCESSING_TIME)
+	elif (opt == 0x03):
+		data = request(addr, TOTAL_PROCESSING_TIMES)
+	elif (opt == 0x08):
+		data = request(addr, PREVIOUS_PROCESSING_TIME)
+	elif (opt == 0x11):
+		data = request(addr, TOTAL_LASER_ON_TIME)
+	elif (opt == 0x23):
+		data = request(addr, TOTAL_TRAVEL_X)
+	elif (opt == 0x33):
+		data = request(addr, TOTAL_TRAVEL_Y)
+	elif (opt == 0x29):
+		data = request(addr, POSITION_AXIS_X)
+	elif (opt == 0x39):
+		data = request(addr, POSITION_AXIS_Y)
+	elif (opt == 0x49):
+		data = request(addr, POSITION_AXIS_Z)
+	elif (opt == 0x59):
+		data = request(addr, POSITION_AXIS_A)
+	else:
+		return -1
+	if data is None:
+		return -1
+	else:
+		return parseNumber(descramblestr(data[-5:]))
+
+def readBoardVersion(addr):
+	data = request(addr, MAINBOARD_VERSION)
+	if data is None:
+		return ""
+	return descramblestr(data[4:-1])
+
+def getSystemInfo(addr):
+	init(addr)
+	return {
+		"totalontime": readSystemInfo(addr, 0x01),
+		"totalprocessingtime": readSystemInfo(addr, 0x02),
+		"totaltravelx": readSystemInfo(addr, 0x23),
+		"totaltravely": readSystemInfo(addr, 0x33),
+		"totalprocessingtimes": readSystemInfo(addr, 0x03),
+		"totallaserontime": readSystemInfo(addr, 0x11),
+		"previousprocessingtime": readSystemInfo(addr, 0x08),
+		"mainboardversion": readBoardVersion(addr)
+	}
 
 #currently we need this
 def callback(addr, data):
 # HANDSHAKE, MODEL, STATE?
-	if data == "\x02\x61\xd4\x89\x0d\xf7":
+	if data == HANDSHAKE:
 #		                          DA  01  05  7E:
 		ssend(addr, scramblestr("\xda\x01\x05\x7e\x06\x28\x41\x4a\x10"))
 # Filelist request
@@ -193,7 +299,7 @@ def callback(addr, data):
 	elif data[2:-1] == "\xd4\x89\x8d":
 		sendSystemInfo(addr, descramble(ord(data[-1])))
 # Model number query
-	elif data == "\x01\xe1\xd4\x89\x0d\x77":
+	elif data == MAINBOARD_VERSION:
 		ssend(addr, scramblestr("\xda\x01\x05\x7f"+"RD-FS 0.1 by Luca Zimmermann"+"\x00"))
 # Generic answer
 ###
@@ -201,7 +307,8 @@ def callback(addr, data):
 # 0x89 0xXX 0xDA 0x00 0xYY 0xZZ
 # Answers are in following format:
 # 0xDA 0x01 0xYY 0xZZ ...
-# Rest of the answer (...) does not noticably change anything
+# so each request [4:6] must match response [2:4]
+# Rest of the answer (...) does not noticably change anything as far as tested
 ###
 	elif data[2:4] == "\xd4\x89":
 		ssend(addr, "\xd4\x09"+data[4:]+"\x89\x89\x89\x89\x89")
@@ -211,7 +318,7 @@ def callback(addr, data):
 
 
 
-def loop():
+def serve():
 	filetransfer = False
 	file = None
 	while True:
@@ -233,7 +340,23 @@ def loop():
 			return data
 	return None
 
-crecv()
+pid = os.fork()
+if not pid:
+	print "SERVER STARTED"
+	server.bind(('', 50200))
+	while True:
+		serve()
+	os.exit(0)
 
-while True:
-	loop()
+try:
+	client.bind(('', 40200))
+	client.settimeout(1) #set non-blocking
+	crecv() #timeout test
+	print getSystemInfo('127.0.0.1') #request test
+	while True:
+		time.sleep(10)
+except Exception as e:
+	traceback.print_exc()
+	print e
+#cleanup
+os.kill(pid, signal.SIGTERM)
